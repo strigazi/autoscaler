@@ -39,6 +39,7 @@ require (
 	github.com/spf13/pflag v1.0.9
 	github.com/stretchr/testify v1.11.1
 	github.com/vburenin/ifacemaker v1.3.0
+	github.com/verda-cloud/verdacloud-sdk-go v1.2.1
 	go.uber.org/mock v0.6.0
 	golang.org/x/crypto v0.47.0
 	golang.org/x/net v0.49.0
