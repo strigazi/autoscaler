@@ -37,8 +37,6 @@ import (
 	"k8s.io/klog/v2"
 	kubelet_config "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	scheduler_config "k8s.io/kubernetes/pkg/scheduler/apis/config"
-
-	"k8s.io/utils/ptr"
 )
 
 // MultiStringFlag is a flag for passing multiple parameters using same flag
@@ -228,7 +226,7 @@ var (
 	checkCapacityProvisioningRequestBatchTimebox = flag.Duration("check-capacity-provisioning-request-batch-timebox", 10*time.Second, "Maximum time to process a batch of provisioning requests.")
 	forceDeleteLongUnregisteredNodes             = flag.Bool("force-delete-unregistered-nodes", false, "Whether to enable force deletion of long unregistered nodes, regardless of the min size of the node group the belong to.")
 	forceDeleteFailedNodes                       = flag.Bool("force-delete-failed-nodes", false, "Whether to enable force deletion of failed nodes, regardless of the min size of the node group the belong to.")
-	enableDynamicResourceAllocation              = flag.Bool("enable-dynamic-resource-allocation", true, "Handle DRA (Dynamic Resource Allocation) objects, locked to true.")
+	enableDynamicResourceAllocation              = flag.Bool("enable-dynamic-resource-allocation", true, "Handle DRA (Dynamic Resource Allocation) objects. Set to false on clusters where the resource.k8s.io API group is not served.")
 	enableCSINodeAwareScheduling                 = flag.Bool("enable-csi-node-aware-scheduling", false, "Whether logic for handling CSINode objects is enabled.")
 	clusterSnapshotParallelism                   = flag.Int("cluster-snapshot-parallelism", 16, "Maximum parallelism of cluster snapshot creation.")
 	predicateParallelism                         = flag.Int("predicate-parallelism", 4, "Maximum parallelism of scheduler predicate checking.")
@@ -296,10 +294,6 @@ func createAutoscalingOptions() config.AutoscalingOptions {
 
 	if *predicateParallelism < 1 {
 		klog.Fatalf("Invalid value for --predicate-parallelism flag: %d", *predicateParallelism)
-	}
-
-	if !ptr.Deref(enableDynamicResourceAllocation, false) {
-		klog.Fatalf("--enable-dynamic-resource-allocation flag must be true: %t", ptr.Deref(enableDynamicResourceAllocation, false))
 	}
 
 	if *scaleDownEnabled == false {
