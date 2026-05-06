@@ -54,6 +54,14 @@ func NewHandle(informerFactory informers.SharedInformerFactory, schedConfig *sch
 		return nil, fmt.Errorf("unexpected scheduler config: expected one scheduler profile only (found %d profiles)", len(schedConfig.Profiles))
 	}
 
+	// In Kubernetes 1.35 the DRA feature gate is locked to true, so the default scheduler config
+	// includes the DynamicResources plugin. That plugin registers ResourceClaim/DeviceClass/
+	// ResourceSlice informers; if the cluster doesn't serve resource.k8s.io, WaitForCacheSync
+	// hangs forever. When DRA is disabled in CA, strip DynamicResources from every extension point.
+	if !draEnabled && schedConfig.Profiles[0].Plugins != nil {
+		disablePluginEverywhere(schedConfig.Profiles[0].Plugins, "DynamicResources")
+	}
+
 	sharedLister := NewDelegatingSchedulerSharedLister()
 	sharedCSIManager := nodevolumelimits.NewCSIManager(informerFactory.Storage().V1().CSINodes().Lister())
 	opts := []schedulerframeworkruntime.Option{
@@ -90,4 +98,34 @@ func NewHandle(informerFactory informers.SharedInformerFactory, schedConfig *sch
 		Framework:        framework,
 		DelegatingLister: sharedLister,
 	}, nil
+}
+
+// disablePluginEverywhere removes the named plugin from every extension point's Enabled list
+// and adds it to every Disabled list, so the scheduler framework runtime won't initialize it.
+func disablePluginEverywhere(plugins *schedulerconfig.Plugins, name string) {
+	sets := []*schedulerconfig.PluginSet{
+		&plugins.PreEnqueue,
+		&plugins.QueueSort,
+		&plugins.PreFilter,
+		&plugins.Filter,
+		&plugins.PostFilter,
+		&plugins.PreScore,
+		&plugins.Score,
+		&plugins.Reserve,
+		&plugins.Permit,
+		&plugins.PreBind,
+		&plugins.Bind,
+		&plugins.PostBind,
+		&plugins.MultiPoint,
+	}
+	for _, set := range sets {
+		filtered := set.Enabled[:0]
+		for _, p := range set.Enabled {
+			if p.Name != name {
+				filtered = append(filtered, p)
+			}
+		}
+		set.Enabled = filtered
+		set.Disabled = append(set.Disabled, schedulerconfig.Plugin{Name: name})
+	}
 }

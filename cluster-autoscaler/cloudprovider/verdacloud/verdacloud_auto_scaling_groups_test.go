@@ -60,13 +60,14 @@ func newTestEnv(t *testing.T) (*VerdacloudManager, *Asg, *autoScalingGroups) {
 	}
 
 	asgs := &autoScalingGroups{
-		registeredAsgs:    make(map[AsgRef]*Asg),
-		asgToInstances:    make(map[AsgRef][]InstanceRef),
-		instanceToAsg:     make(map[InstanceRef]*Asg),
-		instanceIDs:       make(map[InstanceRef]string),
-		asgNodeGroupSpecs: make(map[AsgRef]string),
-		failedInstances:   make(map[string]time.Time),
-		lastFailureCheck:  make(map[AsgRef]time.Time),
+		registeredAsgs:       make(map[AsgRef]*Asg),
+		asgToInstances:       make(map[AsgRef][]InstanceRef),
+		instanceToAsg:        make(map[InstanceRef]*Asg),
+		instanceIDs:          make(map[InstanceRef]string),
+		asgNodeGroupSpecs:    make(map[AsgRef]string),
+		failedInstances:      make(map[string]time.Time),
+		lastFailureCheck:     make(map[AsgRef]time.Time),
+		instanceMissingSince: make(map[InstanceRef]time.Time),
 	}
 	asgs.registeredAsgs[asg.AsgRef] = asg
 
@@ -1420,7 +1421,10 @@ func simulateRegenerate(t *testing.T, asgs *autoScalingGroups, asg *Asg, apiInst
 		asgToInstances: existingAsgToInstances,
 		instanceIDs:    existingInstanceIDs,
 	}
-	asgs.preserveCachedInstances(asg, snapshotCurSize, apiSeenHostnames, oldCache, newCache)
+	expiredByAsg := map[AsgRef]int{}
+	if expired := asgs.preserveCachedInstances(asg, snapshotCurSize, apiSeenHostnames, oldCache, newCache, time.Now()); expired > 0 {
+		expiredByAsg[asg.AsgRef] = expired
+	}
 
 	// Swap + reconcile
 	allFailedInstances := map[AsgRef][]verda.Instance{asg.AsgRef: failedInstances}
@@ -1429,7 +1433,7 @@ func simulateRegenerate(t *testing.T, asgs *autoScalingGroups, asg *Asg, apiInst
 	asgs.instanceToAsg = newCache.instanceToAsg
 	asgs.asgToInstances = newCache.asgToInstances
 	asgs.instanceIDs = newCache.instanceIDs
-	asgs.reconcileCurSize(newCache.asgToInstances, allFailedInstances)
+	asgs.reconcileCurSize(newCache.asgToInstances, allFailedInstances, expiredByAsg)
 	asgs.cacheMutex.Unlock()
 
 	return len(activeInstances), len(failedInstances)
@@ -1580,9 +1584,10 @@ func TestCurSizeStability_DeleteThenRegenerate(t *testing.T) {
 
 func TestCurSizeStability_ExternalDeletion(t *testing.T) {
 	// Scenario 6: Have 3 running → 1 externally deleted (not by us) → regenerate sees 2
-	// Expected: curSize stays 3 (conservative — no failures detected)
-	// This is intentional: curSize only decreases when failed instances are detected.
-	// CA will notice the node is gone and call DecreaseTargetSize if needed.
+	// Expected immediately after deletion: curSize stays 3.
+	// The missing instance is preserved so a transient API blip doesn't cause
+	// a spurious decrement; once it has been absent for INSTANCE_MISSING_THRESHOLD
+	// the phantom is dropped (covered by TestCurSizeStability_PhantomEventuallyDropped).
 	_, asg, asgs := newTestEnv(t)
 
 	asg.curSize = 3
@@ -1595,10 +1600,47 @@ func TestCurSizeStability_ExternalDeletion(t *testing.T) {
 	})
 	simulateRegenerate(t, asgs, asg, apiInstances)
 
-	// curSize stays 3 because: active(2) < curSize(3) but failedCount=0
-	// reconcileCurSize only decreases when failures are detected
 	if asg.curSize != 3 {
-		t.Errorf("curSize should stay 3 (conservative, no failures), got %d", asg.curSize)
+		t.Errorf("curSize should stay 3 immediately after disappearance (within threshold), got %d", asg.curSize)
+	}
+}
+
+func TestCurSizeStability_PhantomEventuallyDropped(t *testing.T) {
+	// Scenario 6b: Have 3 running → 1 vanishes from API without a failure marker →
+	// stays missing past INSTANCE_MISSING_THRESHOLD → curSize decrements to 2.
+	// Regression test for the bug where a successful scale-up's instance later
+	// disappeared cloud-side and the autoscaler held a phantom upcoming-node
+	// reservation indefinitely.
+	_, asg, asgs := newTestEnv(t)
+
+	asg.curSize = 3
+	refs := createTestInstanceRefs(t, 3)
+	asgs.updateCacheWithInstances(asg, toCreateResults(refs))
+
+	// Two of the three are still in the API; the third is the phantom.
+	apiInstances := makeAPIInstances(asg, []string{
+		verda.StatusRunning, verda.StatusRunning,
+	})
+	apiInstances[0].Hostname = refs[0].Hostname
+	apiInstances[1].Hostname = refs[1].Hostname
+	simulateRegenerate(t, asgs, asg, apiInstances)
+	if asg.curSize != 3 {
+		t.Fatalf("curSize should stay 3 immediately after disappearance, got %d", asg.curSize)
+	}
+
+	// Backdate the phantom's missing-since timestamp past the threshold to
+	// simulate enough wall-clock time elapsing.
+	asgs.cacheMutex.Lock()
+	asgs.instanceMissingSince[refs[2]] = time.Now().Add(-INSTANCE_MISSING_THRESHOLD - time.Minute)
+	asgs.cacheMutex.Unlock()
+
+	simulateRegenerate(t, asgs, asg, apiInstances)
+	if asg.curSize != 2 {
+		t.Errorf("curSize should drop to 2 after phantom expiry, got %d", asg.curSize)
+	}
+	cachedRefs, _ := asgs.InstanceRefsForAsg(asg.AsgRef)
+	if len(cachedRefs) != 2 {
+		t.Errorf("expected 2 cached instances after phantom drop, got %d", len(cachedRefs))
 	}
 }
 
@@ -1836,15 +1878,16 @@ func newTestEnvWithMock(t *testing.T) (*mockDCService, *Asg, *autoScalingGroups)
 		},
 	}
 	asgs := &autoScalingGroups{
-		registeredAsgs:    make(map[AsgRef]*Asg),
-		asgToInstances:    make(map[AsgRef][]InstanceRef),
-		instanceToAsg:     make(map[InstanceRef]*Asg),
-		instanceIDs:       make(map[InstanceRef]string),
-		asgNodeGroupSpecs: make(map[AsgRef]string),
-		failedInstances:   make(map[string]time.Time),
-		lastFailureCheck:  make(map[AsgRef]time.Time),
-		cfg:               cfg,
-		dcService:         mock,
+		registeredAsgs:       make(map[AsgRef]*Asg),
+		asgToInstances:       make(map[AsgRef][]InstanceRef),
+		instanceToAsg:        make(map[InstanceRef]*Asg),
+		instanceIDs:          make(map[InstanceRef]string),
+		asgNodeGroupSpecs:    make(map[AsgRef]string),
+		failedInstances:      make(map[string]time.Time),
+		lastFailureCheck:     make(map[AsgRef]time.Time),
+		instanceMissingSince: make(map[InstanceRef]time.Time),
+		cfg:                  cfg,
+		dcService:            mock,
 	}
 	asg := &Asg{
 		AsgRef:                AsgRef{Name: testAsgName},
@@ -2145,7 +2188,7 @@ func TestReconcileCurSize(t *testing.T) {
 			}
 
 			asgs.cacheMutex.Lock()
-			asgs.reconcileCurSize(asgToInstances, failedByAsg)
+			asgs.reconcileCurSize(asgToInstances, failedByAsg, nil)
 			asgs.cacheMutex.Unlock()
 
 			if asg.curSize != tc.expectedCurSize {

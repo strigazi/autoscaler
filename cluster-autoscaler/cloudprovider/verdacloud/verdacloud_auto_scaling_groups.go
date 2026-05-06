@@ -41,6 +41,7 @@ const (
 	FAILED_INSTANCE_BACKOFF_DURATION  = 5 * time.Minute  // wait before retrying after terminal failure
 	FAILED_INSTANCE_CLEANUP_AGE       = 10 * time.Minute // delete stuck failed instances after this
 	FAILED_INSTANCE_MAP_ENTRY_TTL     = 1 * time.Hour    // prevent unbounded map growth
+	INSTANCE_MISSING_THRESHOLD        = 15 * time.Minute // drop preserved instances missing from API longer than this
 	MAX_CONCURRENT_INSTANCE_CREATIONS = 10
 	// NODE_SWEEP_TIMEOUT bounds the K8s API calls used to reap orphan Nodes so
 	// a slow apiserver can't stall the refresh loop.
@@ -65,21 +66,29 @@ type autoScalingGroups struct {
 	failedInstances  map[string]time.Time // tracks failed instances (no_capacity, error, unknown) for backoff
 	lastFailureCheck map[AsgRef]time.Time
 
+	// instanceMissingSince records the first time we observed each preserved
+	// instance was absent from the cloud API. Phantoms (instances that vanished
+	// from the API without surfacing as failed) get pruned once they have been
+	// missing longer than INSTANCE_MISSING_THRESHOLD. Mutated only from
+	// regenerate(), which the autoscaler core invokes serially.
+	instanceMissingSince map[InstanceRef]time.Time
+
 	cacheMutex sync.RWMutex
 }
 
 func newAutoScalingGroups(dcService dcService, nodeGroupSpecs []string, cfg *cloudConfig, kubeClient kube_client.Interface) (*autoScalingGroups, error) {
 	registry := &autoScalingGroups{
-		registeredAsgs:    make(map[AsgRef]*Asg),
-		asgToInstances:    make(map[AsgRef][]InstanceRef),
-		instanceToAsg:     make(map[InstanceRef]*Asg),
-		instanceIDs:       make(map[InstanceRef]string),
-		asgNodeGroupSpecs: make(map[AsgRef]string),
-		failedInstances:   make(map[string]time.Time),
-		lastFailureCheck:  make(map[AsgRef]time.Time),
-		cfg:               cfg,
-		dcService:         dcService,
-		kubeClient:        kubeClient,
+		registeredAsgs:       make(map[AsgRef]*Asg),
+		asgToInstances:       make(map[AsgRef][]InstanceRef),
+		instanceToAsg:        make(map[InstanceRef]*Asg),
+		instanceIDs:          make(map[InstanceRef]string),
+		asgNodeGroupSpecs:    make(map[AsgRef]string),
+		failedInstances:      make(map[string]time.Time),
+		lastFailureCheck:     make(map[AsgRef]time.Time),
+		instanceMissingSince: make(map[InstanceRef]time.Time),
+		cfg:                  cfg,
+		dcService:            dcService,
+		kubeClient:           kubeClient,
 	}
 
 	if err := registry.parseASGNodeGroupSpecs(nodeGroupSpecs); err != nil {
@@ -108,7 +117,6 @@ func (m *autoScalingGroups) GetAsgByRef(ref AsgRef) (*Asg, error) {
 	}
 	return asg, nil
 }
-
 
 func (m *autoScalingGroups) FindASGForInstance(ref *InstanceRef) (*Asg, error) {
 	m.cacheMutex.RLock()
@@ -174,6 +182,8 @@ func (m *autoScalingGroups) regenerate() error {
 		instanceIDs:    make(map[InstanceRef]string),
 	}
 	allFailedInstances := make(map[AsgRef][]verda.Instance)
+	expiredByAsg := make(map[AsgRef]int)
+	now := time.Now()
 
 	oldCache := &instanceMaps{
 		asgToInstances: existingAsgToInstances,
@@ -192,7 +202,9 @@ func (m *autoScalingGroups) regenerate() error {
 			newCache.addInstance(ref, asg, inst.ID)
 		}
 
-		m.preserveCachedInstances(asg, asgCurSizes[asg.AsgRef], apiSeenHostnames, oldCache, newCache)
+		if expired := m.preserveCachedInstances(asg, asgCurSizes[asg.AsgRef], apiSeenHostnames, oldCache, newCache, now); expired > 0 {
+			expiredByAsg[asg.AsgRef] = expired
+		}
 	}
 
 	// 4. Swap cache and reconcile curSize atomically
@@ -200,7 +212,7 @@ func (m *autoScalingGroups) regenerate() error {
 	m.instanceToAsg = newCache.instanceToAsg
 	m.asgToInstances = newCache.asgToInstances
 	m.instanceIDs = newCache.instanceIDs
-	m.reconcileCurSize(newCache.asgToInstances, allFailedInstances)
+	m.reconcileCurSize(newCache.asgToInstances, allFailedInstances, expiredByAsg)
 	m.cacheMutex.Unlock()
 
 	// 5. Handle failed instances (backoff tracking, cleanup)
@@ -289,25 +301,28 @@ func (m *autoScalingGroups) belongsToManagedAsg(hostname string) bool {
 	return false
 }
 
-// reconcileCurSize adjusts curSize for each ASG based on active and failed instance counts.
-// Must be called with cacheMutex held.
+// reconcileCurSize adjusts curSize for each ASG based on active, failed, and
+// expired-phantom instance counts. Must be called with cacheMutex held.
 //
 // Rules:
 //   - If active > curSize: increase (new instances appeared, e.g. manual creation)
-//   - If active < curSize AND failures detected: decrease (failed instances won't become nodes)
+//   - If active < curSize AND (failures detected OR phantoms expired): decrease
+//     (failed instances won't become nodes; expired phantoms have been gone from
+//     the API longer than INSTANCE_MISSING_THRESHOLD)
 //   - Otherwise: keep curSize (optimistic count from scale-up, instances still provisioning)
-func (m *autoScalingGroups) reconcileCurSize(asgToInstances map[AsgRef][]InstanceRef, failedByAsg map[AsgRef][]verda.Instance) {
+func (m *autoScalingGroups) reconcileCurSize(asgToInstances map[AsgRef][]InstanceRef, failedByAsg map[AsgRef][]verda.Instance, expiredByAsg map[AsgRef]int) {
 	for ref, asg := range m.registeredAsgs {
 		activeCount := len(asgToInstances[ref])
 		failedCount := len(failedByAsg[ref])
+		expiredCount := expiredByAsg[ref]
 
 		if activeCount > asg.curSize {
 			klog.V(4).Infof("ASG %s curSize: %d -> %d (active instances increased)",
 				asg.Name, asg.curSize, activeCount)
 			asg.curSize = activeCount
-		} else if failedCount > 0 && asg.curSize > activeCount {
-			klog.Warningf("ASG %s: curSize %d -> %d (detected %d failed instances)",
-				asg.Name, asg.curSize, activeCount, failedCount)
+		} else if asg.curSize > activeCount && (failedCount > 0 || expiredCount > 0) {
+			klog.Warningf("ASG %s: curSize %d -> %d (failed=%d, expired=%d)",
+				asg.Name, asg.curSize, activeCount, failedCount, expiredCount)
 			asg.curSize = activeCount
 		}
 	}
@@ -358,20 +373,49 @@ func (m *autoScalingGroups) categorizeInstancesForAsg(allInstances []verda.Insta
 // snapshotCurSize is the curSize captured under lock at the start of regenerate().
 // apiSeenHostnames contains ALL hostnames seen in the API response (active + failed + ignored),
 // so we only preserve instances that are truly not yet visible to the API.
-func (m *autoScalingGroups) preserveCachedInstances(asg *Asg, snapshotCurSize int, apiSeenHostnames map[string]bool, old *instanceMaps, new *instanceMaps) {
+//
+// Each preserved instance has its first-missing timestamp tracked in
+// instanceMissingSince. Once an instance has been absent from the API for
+// longer than INSTANCE_MISSING_THRESHOLD, it is dropped instead of preserved
+// and counted in the returned `expired` so reconcileCurSize can decrement
+// curSize and free the phantom upcoming-node reservation.
+func (m *autoScalingGroups) preserveCachedInstances(asg *Asg, snapshotCurSize int, apiSeenHostnames map[string]bool, old *instanceMaps, new *instanceMaps, now time.Time) (expired int) {
+	// Clear missing-since for any cached instance that's back in the API.
+	for _, ref := range old.asgToInstances[asg.AsgRef] {
+		if apiSeenHostnames[ref.Hostname] {
+			delete(m.instanceMissingSince, ref)
+		}
+	}
+
 	if len(new.asgToInstances[asg.AsgRef]) >= snapshotCurSize {
-		return
+		return 0
 	}
 
 	for _, existingRef := range old.asgToInstances[asg.AsgRef] {
 		if len(new.asgToInstances[asg.AsgRef]) >= snapshotCurSize {
 			break
 		}
-		if !apiSeenHostnames[existingRef.Hostname] {
-			id := old.instanceIDs[existingRef]
-			new.addInstance(existingRef, asg, id)
+		if apiSeenHostnames[existingRef.Hostname] {
+			continue
 		}
+
+		firstMissing, seen := m.instanceMissingSince[existingRef]
+		if !seen {
+			m.instanceMissingSince[existingRef] = now
+			firstMissing = now
+		}
+		if now.Sub(firstMissing) > INSTANCE_MISSING_THRESHOLD {
+			klog.Warningf("ASG %s: dropping phantom instance %s (missing from API for %v)",
+				asg.Name, existingRef.Hostname, now.Sub(firstMissing).Round(time.Second))
+			delete(m.instanceMissingSince, existingRef)
+			expired++
+			continue
+		}
+
+		id := old.instanceIDs[existingRef]
+		new.addInstance(existingRef, asg, id)
 	}
+	return expired
 }
 
 // isProvisioningFailedStatus returns true if the status indicates the instance
