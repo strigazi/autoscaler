@@ -371,7 +371,7 @@ func main() {
 	// correctly and can panic.
 	if autoscalingOpts.DynamicResourceAllocationEnabled != featureGate.Enabled(features.DynamicResourceAllocation) {
 		if err := featureGate.SetFromMap(map[string]bool{string(features.DynamicResourceAllocation): autoscalingOpts.DynamicResourceAllocationEnabled}); err != nil {
-			klog.Fatalf("couldn't set the DRA feature gate to %v: %v", autoscalingOpts.DynamicResourceAllocationEnabled, err)
+			klog.Warningf("couldn't set the DRA feature gate to %v (likely locked at the kube featuregate level): %v. Continuing with CA-local DRA flag = %v; the scheduler framework's DynamicResources plugin will be stripped accordingly.", autoscalingOpts.DynamicResourceAllocationEnabled, err, autoscalingOpts.DynamicResourceAllocationEnabled)
 		}
 	}
 
